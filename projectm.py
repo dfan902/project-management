@@ -133,6 +133,34 @@ def add_task(
     ).execute()
 
 
+def delete_task(supabase: Client, task_id: int) -> None:
+    supabase.table("tasks").delete().eq("id", task_id).execute()
+
+
+def update_project(
+    supabase: Client,
+    project_id: int,
+    name: str,
+    description: str,
+    due_date: str | None,
+    status: str,
+) -> None:
+    supabase.table("projects").update(
+        {
+            "name": name,
+            "description": description,
+            "due_date": due_date,
+            "status": status,
+        }
+    ).eq("id", project_id).execute()
+
+
+def delete_project(supabase: Client, project_id: int) -> None:
+    # Clear project links from tasks first so the project can be removed safely
+    supabase.table("tasks").update({"project_id": None}).eq("project_id", project_id).execute()
+    supabase.table("projects").delete().eq("id", project_id).execute()
+
+
 def update_task(
     supabase: Client,
     task_id: int,
@@ -158,7 +186,7 @@ def update_task(
 # -------------------------
 
 def make_safe_sheet_name(name: str, used_names: set[str]) -> str:
-    safe = re.sub(r"[\\/*?:\[\]]", "_", str(name)).strip()
+    safe = re.sub(r"[\/*?:\[\]]", "_", str(name)).strip()
     safe = safe.strip("'")
     if not safe:
         safe = "Project"
@@ -333,6 +361,48 @@ def main() -> None:
                     st.success("Project created.")
                     st.rerun()
 
+        with st.expander("Edit or Delete Project"):
+            if projects_df.empty:
+                st.info("No projects available.")
+            else:
+                project_options = {f"#{row['id']} - {row['name']}": row for _, row in projects_df.iterrows()}
+                selected_project_label = st.selectbox("Select project", list(project_options.keys()))
+                selected_project_row = project_options[selected_project_label]
+                existing_project_due = pd.to_datetime(selected_project_row["due_date"], errors="coerce")
+
+                with st.form("edit_project_form"):
+                    edit_project_name = st.text_input("Project name", value=selected_project_row["name"] or "")
+                    edit_project_description = st.text_area("Description", value=selected_project_row["description"] or "")
+                    edit_project_due = st.date_input(
+                        "Project due date",
+                        value=existing_project_due.date() if pd.notna(existing_project_due) else None,
+                    )
+                    edit_project_status = st.selectbox(
+                        "Project status",
+                        PROJECT_STATUSES,
+                        index=PROJECT_STATUSES.index(selected_project_row["status"]) if selected_project_row["status"] in PROJECT_STATUSES else 0,
+                    )
+
+                    save_project = st.form_submit_button("Save project changes")
+                    delete_project_btn = st.form_submit_button("Delete project")
+
+                    if save_project and edit_project_name.strip():
+                        update_project(
+                            supabase,
+                            int(selected_project_row["id"]),
+                            edit_project_name.strip(),
+                            edit_project_description.strip(),
+                            edit_project_due.isoformat() if edit_project_due else None,
+                            edit_project_status,
+                        )
+                        st.success("Project updated.")
+                        st.rerun()
+
+                    if delete_project_btn:
+                        delete_project(supabase, int(selected_project_row["id"]))
+                        st.success("Project deleted.")
+                        st.rerun()
+
         with st.expander("Add Task"):
             with st.form("add_task_form", clear_on_submit=True):
                 title = st.text_input("Task title")
@@ -365,7 +435,7 @@ def main() -> None:
                     st.rerun()
 
     st.divider()
-    st.subheader("Update Task")
+    st.subheader("Edit or Delete Task")
     if filtered_df.empty:
         st.info("No tasks available to edit.")
     else:
@@ -385,7 +455,10 @@ def main() -> None:
             edit_latest_update = st.text_area("Latest progress update", value=selected_task["latest_update"] or "")
             edit_notes = st.text_area("Notes", value=selected_task["notes"] or "")
 
-            if st.form_submit_button("Save changes"):
+            save_task = st.form_submit_button("Save task changes")
+            delete_task_btn = st.form_submit_button("Delete task")
+
+            if save_task:
                 update_task(
                     supabase,
                     int(selected_task["id"]),
@@ -396,6 +469,11 @@ def main() -> None:
                     edit_notes.strip(),
                 )
                 st.success("Task updated.")
+                st.rerun()
+
+            if delete_task_btn:
+                delete_task(supabase, int(selected_task["id"]))
+                st.success("Task deleted.")
                 st.rerun()
 
 
