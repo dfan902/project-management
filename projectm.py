@@ -6,7 +6,7 @@
 # - Project page timeline + updates
 # - Project page task actions via top buttons
 # - Real team field on tasks
-# - Settings for users + export only
+# - Settings for users, teams, and export
 
 from datetime import date, timedelta
 from io import BytesIO
@@ -38,6 +38,19 @@ def get_supabase() -> Client:
 def fetch_users(supabase: Client) -> pd.DataFrame:
     response = supabase.table("users").select("id, name").order("name").execute()
     return pd.DataFrame(response.data or [])
+
+
+def fetch_teams(supabase: Client) -> pd.DataFrame:
+    try:
+        response = supabase.table("teams").select("id, name").order("name").execute()
+    except Exception:
+        df = pd.DataFrame(columns=["id", "name"])
+        df.attrs["missing_table"] = True
+        return df
+
+    df = pd.DataFrame(response.data or [], columns=["id", "name"])
+    df.attrs["missing_table"] = False
+    return df
 
 
 def fetch_projects(supabase: Client) -> pd.DataFrame:
@@ -105,6 +118,21 @@ def add_user(supabase: Client, name: str) -> None:
     supabase.table("users").insert({"name": name}).execute()
 
 
+def add_team(supabase: Client, name: str) -> None:
+    supabase.table("teams").insert({"name": name}).execute()
+
+
+def update_team(supabase: Client, team_id: int, old_name: str, new_name: str) -> None:
+    supabase.table("teams").update({"name": new_name}).eq("id", team_id).execute()
+    if old_name != new_name:
+        supabase.table("tasks").update({"team": new_name}).eq("team", old_name).execute()
+
+
+def delete_team(supabase: Client, team_id: int, team_name: str) -> None:
+    supabase.table("tasks").update({"team": None}).eq("team", team_name).execute()
+    supabase.table("teams").delete().eq("id", team_id).execute()
+
+
 def add_project(supabase: Client, name: str, description: str, due_date: str | None, status: str) -> None:
     supabase.table("projects").insert(
         {
@@ -142,7 +170,7 @@ def delete_project(supabase: Client, project_id: int) -> None:
 def add_task(
     supabase: Client,
     title: str,
-    team: str,
+    team: str | None,
     project_id: int | None,
     owner_primary_id: int | None,
     owner_secondary_id: int | None,
@@ -172,7 +200,7 @@ def update_task_full(
     supabase: Client,
     task_id: int,
     title: str,
-    team: str,
+    team: str | None,
     project_id: int | None,
     owner_primary_id: int | None,
     owner_secondary_id: int | None,
@@ -474,6 +502,7 @@ def render_project_page(
     projects_df: pd.DataFrame,
     tasks_df: pd.DataFrame,
     users_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
 ) -> None:
     project_id = st.session_state.get("selected_project_id")
 
@@ -490,6 +519,8 @@ def render_project_page(
     project_name = project_row["name"]
     project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame()
     user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
+    teams_table_missing = teams_df.attrs.get("missing_table", False)
+    team_names = sorted(teams_df["name"].dropna().tolist()) if "name" in teams_df.columns else []
 
     back_col, title_col, action_col = st.columns([1, 4, 1])
 
@@ -586,7 +617,14 @@ def render_project_page(
 
         with st.form("project_page_add_task_form", clear_on_submit=True):
             title = st.text_input("Task title")
-            team = st.text_input("Team")
+            if teams_table_missing:
+                team = st.text_input("Team", help="Create a `teams` table to manage team values from Settings.")
+            else:
+                team = st.selectbox(
+                    "Team",
+                    [""] + team_names,
+                    format_func=lambda x: x or "None",
+                )
             selected_primary = st.selectbox("Primary owner", list(user_map.keys()) if user_map else [None])
             selected_secondary = st.selectbox("Secondary owner", [None] + list(user_map.keys()), format_func=lambda x: x or "None")
             progress_percent = st.slider("Progress %", 0, 100, 0)
@@ -600,7 +638,7 @@ def render_project_page(
                 add_task(
                     supabase,
                     title.strip(),
-                    team.strip(),
+                    team.strip() if isinstance(team, str) else (team or None),
                     int(project_row["id"]),
                     user_map.get(selected_primary),
                     user_map.get(selected_secondary) if selected_secondary else None,
@@ -626,10 +664,24 @@ def render_project_page(
 
             current_primary_name = next((name for name, uid in user_map.items() if uid == selected_task["owner_primary_id"]), None)
             current_secondary_name = next((name for name, uid in user_map.items() if uid == selected_task["owner_secondary_id"]), None)
+            current_team_name = selected_task["team"] or ""
 
             with st.form("project_page_edit_task_form"):
                 edit_title = st.text_input("Task title", value=selected_task["title"] or "")
-                edit_team = st.text_input("Team", value=selected_task["team"] or "")
+                if teams_table_missing:
+                    edit_team = st.text_input(
+                        "Team",
+                        value=current_team_name,
+                        help="Create a `teams` table to manage team values from Settings.",
+                    )
+                else:
+                    team_choices = [""] + sorted(set(team_names + ([current_team_name] if current_team_name else [])))
+                    edit_team = st.selectbox(
+                        "Team",
+                        team_choices,
+                        index=team_choices.index(current_team_name) if current_team_name in team_choices else 0,
+                        format_func=lambda x: x or "None",
+                    )
                 owner_choices = list(user_map.keys()) if user_map else [None]
                 edit_primary_owner = st.selectbox(
                     "Primary owner",
@@ -660,7 +712,7 @@ def render_project_page(
                         supabase,
                         int(selected_task["id"]),
                         edit_title.strip(),
-                        edit_team.strip(),
+                        edit_team.strip() if isinstance(edit_team, str) else (edit_team or None),
                         int(project_row["id"]),
                         user_map.get(edit_primary_owner),
                         user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
@@ -704,7 +756,12 @@ def render_project_page(
     render_project_updates(project_tasks)
 
 
-def render_settings(supabase: Client, users_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+def render_settings(
+    supabase: Client,
+    users_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    tasks_df: pd.DataFrame,
+) -> None:
     back_col, title_col = st.columns([1, 5])
     with back_col:
         if st.button("← Home", use_container_width=True):
@@ -712,9 +769,9 @@ def render_settings(supabase: Client, users_df: pd.DataFrame, tasks_df: pd.DataF
             st.rerun()
     with title_col:
         st.subheader("Settings")
-        st.caption("Manage users and exports")
+        st.caption("Manage users, teams, and exports")
 
-    tab_users, tab_exports = st.tabs(["Users", "Export"])
+    tab_users, tab_teams, tab_exports = st.tabs(["Users", "Teams", "Export"])
 
     with tab_users:
         st.markdown("#### Add user")
@@ -731,6 +788,67 @@ def render_settings(supabase: Client, users_df: pd.DataFrame, tasks_df: pd.DataF
             st.info("No users available.")
         else:
             st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+    with tab_teams:
+        if teams_df.attrs.get("missing_table", False):
+            st.warning(
+                "The `teams` table was not found yet. Add it in Supabase SQL first, then this tab can manage team values."
+            )
+            st.code(
+                "create table if not exists public.teams (\n"
+                "  id bigint generated by default as identity primary key,\n"
+                "  name text not null unique\n"
+                ");"
+            )
+        else:
+            st.markdown("#### Add team")
+            with st.form("add_team_form", clear_on_submit=True):
+                team_name = st.text_input("Team name")
+                submitted = st.form_submit_button("Add team")
+                if submitted and team_name.strip():
+                    add_team(supabase, team_name.strip())
+                    st.success("Team added.")
+                    st.rerun()
+
+            st.markdown("#### Edit or delete team")
+            if teams_df.empty:
+                st.info("No teams available.")
+            else:
+                team_options = {f"#{row['id']} - {row['name']}": row for _, row in teams_df.iterrows()}
+                selected_label = st.selectbox("Select team", list(team_options.keys()), key="settings_team_editor")
+                selected_team = team_options[selected_label]
+
+                with st.form("edit_team_form"):
+                    edit_team_name = st.text_input("Team name", value=selected_team["name"] or "")
+                    confirm_delete_team = st.checkbox("I confirm I want to permanently delete this team")
+                    save_team = st.form_submit_button("Save team changes")
+                    delete_team_btn = st.form_submit_button("Delete team")
+
+                    if save_team and edit_team_name.strip():
+                        update_team(
+                            supabase,
+                            int(selected_team["id"]),
+                            selected_team["name"],
+                            edit_team_name.strip(),
+                        )
+                        st.success("Team updated.")
+                        st.rerun()
+
+                    if delete_team_btn:
+                        if not confirm_delete_team:
+                            st.error("Please check the confirmation box before deleting this team.")
+                        else:
+                            delete_team(
+                                supabase,
+                                int(selected_team["id"]),
+                                selected_team["name"],
+                            )
+                            st.success("Team deleted.")
+                            st.rerun()
+
+            if not teams_df.empty:
+                st.markdown("#### Current teams")
+                st.dataframe(teams_df, use_container_width=True, hide_index=True)
 
     with tab_exports:
         st.markdown("#### Export visible task data")
@@ -779,6 +897,7 @@ def main() -> None:
 
     supabase = get_supabase()
     users_df = fetch_users(supabase)
+    teams_df = fetch_teams(supabase)
     projects_df = fetch_projects(supabase)
     tasks_df = fetch_tasks(supabase)
 
@@ -787,9 +906,9 @@ def main() -> None:
 
     page = st.session_state.get("page", "Home")
     if page == "Settings":
-        render_settings(supabase, users_df, tasks_df)
+        render_settings(supabase, users_df, teams_df, tasks_df)
     elif page == "Project":
-        render_project_page(supabase, projects_df, tasks_df, users_df)
+        render_project_page(supabase, projects_df, tasks_df, users_df, teams_df)
     else:
         render_home(supabase, projects_df, tasks_df)
 
@@ -810,6 +929,11 @@ if __name__ == "__main__":
 # Run this in the Supabase SQL editor
 #
 # create table if not exists public.users (
+#   id bigint generated by default as identity primary key,
+#   name text not null unique
+# );
+#
+# create table if not exists public.teams (
 #   id bigint generated by default as identity primary key,
 #   name text not null unique
 # );
