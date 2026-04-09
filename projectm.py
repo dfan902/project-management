@@ -1,13 +1,14 @@
 # app.py
-# Streamlit + Supabase version of a lightweight internal project tracker
-# Run locally with: streamlit run app.py
+# Phase 1 UI restructure: Home + Settings navigation
+# Streamlit + Supabase lightweight internal project tracker
 
 from datetime import date
-import pandas as pd
-import streamlit as st
 from io import BytesIO
 import re
-from supabase import create_client, Client
+
+import pandas as pd
+import streamlit as st
+from supabase import Client, create_client
 
 STATUSES = ["Not Started", "In Progress", "Blocked", "Done"]
 PROJECT_STATUSES = ["Not Started", "In Progress", "Done"]
@@ -156,14 +157,17 @@ def update_project(
 
 
 def delete_project(supabase: Client, project_id: int) -> None:
-    # Clear project links from tasks first so the project can be removed safely
     supabase.table("tasks").update({"project_id": None}).eq("project_id", project_id).execute()
     supabase.table("projects").delete().eq("id", project_id).execute()
 
 
-def update_task(
+def update_task_full(
     supabase: Client,
     task_id: int,
+    title: str,
+    project_id: int | None,
+    owner_primary_id: int | None,
+    owner_secondary_id: int | None,
     progress_percent: int,
     due_date: str | None,
     status: str,
@@ -172,6 +176,10 @@ def update_task(
 ) -> None:
     supabase.table("tasks").update(
         {
+            "title": title,
+            "project_id": project_id,
+            "owner_primary_id": owner_primary_id,
+            "owner_secondary_id": owner_secondary_id,
             "progress_percent": progress_percent,
             "due_date": due_date,
             "status": status,
@@ -182,19 +190,16 @@ def update_task(
 
 
 # -------------------------
-# UI helpers
+# Export helpers
 # -------------------------
 
 def make_safe_sheet_name(name: str, used_names: set[str]) -> str:
-    safe = re.sub(r"[\/*?:\[\]]", "_", str(name)).strip()
+    safe = re.sub(r"[\\/*?:\[\]]", "_", str(name)).strip()
     safe = safe.strip("'")
     if not safe:
         safe = "Project"
-
-    # Excel sheet names max out at 31 characters
     safe = safe[:31]
 
-    # Ensure uniqueness after sanitizing/truncating
     original = safe
     counter = 2
     while safe in used_names:
@@ -212,17 +217,13 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         used_names = set()
-
-        # Summary sheet
         summary_name = make_safe_sheet_name("All Visible Tasks", used_names)
         export_df.to_excel(writer, index=False, sheet_name=summary_name)
 
-        # Keep only non-completed tasks for separate project sheets
         working_df = export_df[export_df["project"].notna()].copy()
         if "status" in working_df.columns:
             working_df = working_df[working_df["status"] != "Done"]
 
-        # One sheet per active project
         if not working_df.empty:
             for project_name in sorted(working_df["project"].dropna().unique()):
                 project_df = working_df[working_df["project"] == project_name].copy()
@@ -233,124 +234,152 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def render_metrics(tasks_df: pd.DataFrame) -> None:
-    total = len(tasks_df)
-    done = len(tasks_df[tasks_df["status"] == "Done"]) if not tasks_df.empty else 0
-    blocked = len(tasks_df[tasks_df["status"] == "Blocked"]) if not tasks_df.empty else 0
-    due_soon = 0
+# -------------------------
+# UI helpers
+# -------------------------
 
-    if not tasks_df.empty and "due_date" in tasks_df.columns:
-        temp = tasks_df.copy()
-        temp["due_date"] = pd.to_datetime(temp["due_date"], errors="coerce")
-        today = pd.Timestamp(date.today())
-        due_soon = len(
-            temp[
-                (temp["due_date"].notna())
-                & (temp["due_date"] >= today)
-                & (temp["due_date"] <= today + pd.Timedelta(days=7))
-            ]
+def render_top_bar() -> None:
+    top_left, top_right = st.columns([6, 1])
+    with top_left:
+        st.title("Project Tracker")
+        st.caption("Internal project visibility dashboard")
+    with top_right:
+        if st.button("⚙️", help="Open settings", use_container_width=True):
+            st.session_state["page"] = "Settings"
+            st.rerun()
+
+
+def render_home(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+    st.subheader("Projects")
+    st.write("Select a project to review its details.")
+
+    if projects_df.empty:
+        st.info("No projects available yet.")
+        return
+
+    project_cards = []
+    for _, project in projects_df.iterrows():
+        project_name = project.get("name")
+        project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame()
+        total_tasks = len(project_tasks)
+        blocked_tasks = len(project_tasks[project_tasks["status"] == "Blocked"]) if not project_tasks.empty else 0
+
+        overdue_tasks = 0
+        if not project_tasks.empty and "due_date" in project_tasks.columns:
+            due_dates = pd.to_datetime(project_tasks["due_date"], errors="coerce")
+            overdue_tasks = int(((due_dates < pd.Timestamp(date.today())) & (project_tasks["status"] != "Done")).sum())
+
+        project_cards.append(
+            {
+                "id": project.get("id"),
+                "name": project_name,
+                "status": project.get("status"),
+                "due_date": project.get("due_date"),
+                "total_tasks": total_tasks,
+                "blocked_tasks": blocked_tasks,
+                "overdue_tasks": overdue_tasks,
+            }
         )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Tasks", total)
-    c2.metric("Done", done)
-    c3.metric("Blocked", blocked)
-    c4.metric("Due in 7 Days", due_soon)
+    for start in range(0, len(project_cards), 3):
+        cols = st.columns(3)
+        for col, card in zip(cols, project_cards[start:start+3]):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"### {card['name']}")
+                    st.write(f"**Status:** {card['status'] or '—'}")
+                    st.write(f"**Due date:** {card['due_date'] or '—'}")
+                    st.write(f"**Tasks:** {card['total_tasks']}")
+                    st.write(f"**Blocked:** {card['blocked_tasks']}")
+                    st.write(f"**Overdue:** {card['overdue_tasks']}")
+                    if st.button("Open project", key=f"open_project_{card['id']}", use_container_width=True):
+                        st.session_state["selected_project_id"] = int(card["id"])
+                        st.session_state["page"] = "Project"
+                        st.rerun()
 
 
-def main() -> None:
-    st.set_page_config(page_title="Internal Project Tracker", layout="wide")
-    st.title("Internal Project Tracker")
-    st.caption("Shared internal tracker using Streamlit + Supabase.")
+def render_project_placeholder(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+    project_id = st.session_state.get("selected_project_id")
+    if not project_id or projects_df.empty:
+        st.info("Choose a project from the home page.")
+        return
 
-    supabase = get_supabase()
+    match = projects_df[projects_df["id"] == project_id]
+    if match.empty:
+        st.warning("This project could not be found.")
+        return
 
-    users_df = fetch_users(supabase)
-    projects_df = fetch_projects(supabase)
-    tasks_df = fetch_tasks(supabase)
+    project_row = match.iloc[0]
+    project_name = project_row["name"]
+    project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame()
 
-    st.sidebar.header("Filters")
-    status_filter = st.sidebar.selectbox("Status", ["All"] + STATUSES)
-    owner_names = users_df["name"].tolist() if not users_df.empty else []
-    project_names = projects_df["name"].tolist() if not projects_df.empty else []
-    owner_filter = st.sidebar.selectbox("Owner", ["All"] + owner_names)
-    project_filter = st.sidebar.selectbox("Project", ["All"] + project_names)
+    back_col, title_col = st.columns([1, 5])
+    with back_col:
+        if st.button("← Back", use_container_width=True):
+            st.session_state["page"] = "Home"
+            st.rerun()
+    with title_col:
+        st.subheader(project_name)
+        st.caption("Phase 1 placeholder for the future timeline and updates experience")
 
-    filtered_df = tasks_df.copy()
-    if not filtered_df.empty:
-        if status_filter != "All":
-            filtered_df = filtered_df[filtered_df["status"] == status_filter]
-        if owner_filter != "All":
-            filtered_df = filtered_df[
-                (filtered_df["owner_primary"] == owner_filter)
-                | (filtered_df["owner_secondary"] == owner_filter)
-            ]
-        if project_filter != "All":
-            filtered_df = filtered_df[filtered_df["project"] == project_filter]
+    info1, info2, info3, info4 = st.columns(4)
+    info1.metric("Tasks", len(project_tasks))
+    info2.metric("Blocked", len(project_tasks[project_tasks["status"] == "Blocked"]) if not project_tasks.empty else 0)
+    info3.metric("Done", len(project_tasks[project_tasks["status"] == "Done"]) if not project_tasks.empty else 0)
+    info4.metric("Due date", project_row["due_date"] or "—")
 
-    render_metrics(filtered_df)
     st.divider()
+    st.markdown("#### Project tasks preview")
+    if project_tasks.empty:
+        st.info("No tasks in this project yet.")
+    else:
+        preview_df = project_tasks[[
+            "title", "owner_primary", "owner_secondary", "due_date", "status", "latest_update", "notes"
+        ]].copy()
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-    left, right = st.columns([1.2, 1])
+    st.info("Next phase: replace this preview with a visual timeline plus filtered updates section.")
 
-    with left:
-        st.subheader("Tasks")
-        if filtered_df.empty:
-            st.info("No tasks found.")
+
+def render_settings(supabase: Client, users_df: pd.DataFrame, projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+    back_col, title_col = st.columns([1, 5])
+    with back_col:
+        if st.button("← Home", use_container_width=True):
+            st.session_state["page"] = "Home"
+            st.rerun()
+    with title_col:
+        st.subheader("Settings")
+        st.caption("Manage users, projects, tasks, and exports")
+
+    tab_users, tab_projects, tab_tasks, tab_exports = st.tabs(["Users", "Projects", "Tasks", "Export"])
+
+    with tab_users:
+        st.markdown("#### Add user")
+        with st.form("add_user_form", clear_on_submit=True):
+            user_name = st.text_input("User name")
+            submitted = st.form_submit_button("Add user")
+            if submitted and user_name.strip():
+                add_user(supabase, user_name.strip())
+                st.success("User added.")
+                st.rerun()
+
+        st.markdown("#### Current users")
+        if users_df.empty:
+            st.info("No users available.")
         else:
-            display_df = filtered_df[
-                [
-                    "id",
-                    "title",
-                    "project",
-                    "owner_primary",
-                    "owner_secondary",
-                    "progress_percent",
-                    "due_date",
-                    "status",
-                    "latest_update",
-                    "notes",
-                    "updated_at",
-                ]
-            ]
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "progress_percent": st.column_config.ProgressColumn(
-                        "Progress",
-                        min_value=0,
-                        max_value=100,
-                        format="%d%%",
-                    )
-                },
-            )
+            st.dataframe(users_df, use_container_width=True, hide_index=True)
 
-            excel_bytes = dataframe_to_excel_bytes(display_df)
-            st.download_button(
-                label="Export to Excel",
-                data=excel_bytes,
-                file_name="project_tracker_projects_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    with right:
-        with st.expander("Add User"):
-            with st.form("add_user_form", clear_on_submit=True):
-                user_name = st.text_input("User name")
-                if st.form_submit_button("Add user") and user_name.strip():
-                    add_user(supabase, user_name.strip())
-                    st.success("User added.")
-                    st.rerun()
-
-        with st.expander("Add Project"):
+    with tab_projects:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Add project")
             with st.form("add_project_form", clear_on_submit=True):
                 project_name = st.text_input("Project name")
                 project_description = st.text_area("Description")
                 project_due_date = st.date_input("Project due date", value=None)
                 project_status = st.selectbox("Project status", PROJECT_STATUSES)
-                if st.form_submit_button("Create project") and project_name.strip():
+                submitted = st.form_submit_button("Create project")
+                if submitted and project_name.strip():
                     add_project(
                         supabase,
                         project_name.strip(),
@@ -361,7 +390,8 @@ def main() -> None:
                     st.success("Project created.")
                     st.rerun()
 
-        with st.expander("Edit or Delete Project"):
+        with right:
+            st.markdown("#### Edit or delete project")
             if projects_df.empty:
                 st.info("No projects available.")
             else:
@@ -372,7 +402,7 @@ def main() -> None:
 
                 with st.form("edit_project_form"):
                     edit_project_name = st.text_input("Project name", value=selected_project_row["name"] or "")
-                    edit_project_description = st.text_area("Description", value=selected_project_row["description"] or "")
+                    edit_project_description = st.text_area("Description", value=selected_project_row.get("description", "") or "")
                     edit_project_due = st.date_input(
                         "Project due date",
                         value=existing_project_due.date() if pd.notna(existing_project_due) else None,
@@ -407,7 +437,10 @@ def main() -> None:
                             st.success("Project deleted.")
                             st.rerun()
 
-        with st.expander("Add Task"):
+    with tab_tasks:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Add task")
             with st.form("add_task_form", clear_on_submit=True):
                 title = st.text_input("Task title")
                 project_map = {row["name"]: row["id"] for _, row in projects_df.iterrows()} if not projects_df.empty else {}
@@ -422,7 +455,8 @@ def main() -> None:
                 latest_update = st.text_area("Latest progress update")
                 notes = st.text_area("Notes")
 
-                if st.form_submit_button("Create task") and title.strip() and selected_primary:
+                submitted = st.form_submit_button("Create task")
+                if submitted and title.strip() and selected_primary:
                     add_task(
                         supabase,
                         title.strip(),
@@ -438,94 +472,130 @@ def main() -> None:
                     st.success("Task created.")
                     st.rerun()
 
+        with right:
+            st.markdown("#### Edit or delete task")
+            if tasks_df.empty:
+                st.info("No tasks available.")
+            else:
+                task_options = {f"#{row['id']} - {row['title']}": row for _, row in tasks_df.iterrows()}
+                selected_label = st.selectbox("Select task", list(task_options.keys()))
+                selected_task = task_options[selected_label]
+
+                task_project_map = {row["name"]: row["id"] for _, row in projects_df.iterrows()} if not projects_df.empty else {}
+                task_user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
+
+                current_project_name = next((name for name, pid in task_project_map.items() if pid == selected_task["project_id"]), None)
+                current_primary_name = next((name for name, uid in task_user_map.items() if uid == selected_task["owner_primary_id"]), None)
+                current_secondary_name = next((name for name, uid in task_user_map.items() if uid == selected_task["owner_secondary_id"]), None)
+
+                with st.form("edit_task_form"):
+                    edit_title = st.text_input("Task title", value=selected_task["title"] or "")
+                    project_choices = [None] + list(task_project_map.keys())
+                    edit_project_name = st.selectbox(
+                        "Project",
+                        project_choices,
+                        index=project_choices.index(current_project_name) if current_project_name in project_choices else 0,
+                        format_func=lambda x: x or "None",
+                    )
+
+                    owner_choices = list(task_user_map.keys()) if task_user_map else [None]
+                    edit_primary_owner = st.selectbox(
+                        "Primary owner",
+                        owner_choices,
+                        index=owner_choices.index(current_primary_name) if current_primary_name in owner_choices else 0,
+                    )
+                    secondary_choices = [None] + list(task_user_map.keys())
+                    edit_secondary_owner = st.selectbox(
+                        "Secondary owner",
+                        secondary_choices,
+                        index=secondary_choices.index(current_secondary_name) if current_secondary_name in secondary_choices else 0,
+                        format_func=lambda x: x or "None",
+                    )
+
+                    edit_progress = st.slider("Progress %", 0, 100, int(selected_task["progress_percent"] or 0))
+                    existing_due = pd.to_datetime(selected_task["due_date"], errors="coerce")
+                    edit_due = st.date_input("Due date", value=existing_due.date() if pd.notna(existing_due) else None)
+                    edit_status = st.selectbox(
+                        "Status",
+                        STATUSES,
+                        index=STATUSES.index(selected_task["status"]) if selected_task["status"] in STATUSES else 0,
+                    )
+                    edit_latest_update = st.text_area("Latest progress update", value=selected_task["latest_update"] or "")
+                    edit_notes = st.text_area("Notes", value=selected_task["notes"] or "")
+                    confirm_delete_task = st.checkbox("I confirm I want to permanently delete this task")
+
+                    save_task = st.form_submit_button("Save task changes")
+                    delete_task_btn = st.form_submit_button("Delete task")
+
+                    if save_task and edit_title.strip() and edit_primary_owner:
+                        update_task_full(
+                            supabase,
+                            int(selected_task["id"]),
+                            edit_title.strip(),
+                            task_project_map.get(edit_project_name),
+                            task_user_map.get(edit_primary_owner),
+                            task_user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
+                            edit_progress,
+                            edit_due.isoformat() if edit_due else None,
+                            edit_status,
+                            edit_latest_update.strip(),
+                            edit_notes.strip(),
+                        )
+                        st.success("Task updated.")
+                        st.rerun()
+
+                    if delete_task_btn:
+                        if not confirm_delete_task:
+                            st.error("Please check the confirmation box before deleting this task.")
+                        else:
+                            delete_task(supabase, int(selected_task["id"]))
+                            st.success("Task deleted.")
+                            st.rerun()
+
+    with tab_exports:
+        st.markdown("#### Export visible task data")
+        if tasks_df.empty:
+            st.info("No task data available to export.")
+        else:
+            export_df = tasks_df[[
+                "id", "title", "project", "owner_primary", "owner_secondary",
+                "progress_percent", "due_date", "status", "latest_update", "notes", "updated_at"
+            ]].copy()
+            excel_bytes = dataframe_to_excel_bytes(export_df)
+            st.download_button(
+                label="Export to Excel",
+                data=excel_bytes,
+                file_name="project_tracker_projects_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.dataframe(export_df, use_container_width=True, hide_index=True)
+
+
+# -------------------------
+# Main app
+# -------------------------
+
+def main() -> None:
+    st.set_page_config(page_title="Internal Project Tracker", layout="wide")
+
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Home"
+
+    supabase = get_supabase()
+    users_df = fetch_users(supabase)
+    projects_df = fetch_projects(supabase)
+    tasks_df = fetch_tasks(supabase)
+
+    render_top_bar()
     st.divider()
-    st.subheader("Edit or Delete Task")
-    if filtered_df.empty:
-        st.info("No tasks available to edit.")
+
+    page = st.session_state.get("page", "Home")
+    if page == "Settings":
+        render_settings(supabase, users_df, projects_df, tasks_df)
+    elif page == "Project":
+        render_project_placeholder(projects_df, tasks_df)
     else:
-        task_options = {f"#{row['id']} - {row['title']}": row for _, row in filtered_df.iterrows()}
-        selected_label = st.selectbox("Select task", list(task_options.keys()))
-        selected_task = task_options[selected_label]
-
-        with st.form("edit_task_form"):
-            task_project_map = {row["name"]: row["id"] for _, row in projects_df.iterrows()} if not projects_df.empty else {}
-            task_user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
-
-            current_project_name = None
-            for name, pid in task_project_map.items():
-                if pid == selected_task["project_id"]:
-                    current_project_name = name
-                    break
-
-            current_primary_name = None
-            for name, uid in task_user_map.items():
-                if uid == selected_task["owner_primary_id"]:
-                    current_primary_name = name
-                    break
-
-            current_secondary_name = None
-            for name, uid in task_user_map.items():
-                if uid == selected_task["owner_secondary_id"]:
-                    current_secondary_name = name
-                    break
-
-            edit_title = st.text_input("Task title", value=selected_task["title"] or "")
-            edit_project_name = st.selectbox(
-                "Project",
-                [None] + list(task_project_map.keys()),
-                index=([None] + list(task_project_map.keys())).index(current_project_name) if current_project_name in ([None] + list(task_project_map.keys())) else 0,
-                format_func=lambda x: x or "None",
-            )
-            edit_primary_owner = st.selectbox(
-                "Primary owner",
-                list(task_user_map.keys()) if task_user_map else [None],
-                index=(list(task_user_map.keys()).index(current_primary_name) if current_primary_name in list(task_user_map.keys()) else 0) if task_user_map else 0,
-            )
-            edit_secondary_owner = st.selectbox(
-                "Secondary owner",
-                [None] + list(task_user_map.keys()),
-                index=([None] + list(task_user_map.keys())).index(current_secondary_name) if current_secondary_name in ([None] + list(task_user_map.keys())) else 0,
-                format_func=lambda x: x or "None",
-            )
-            edit_progress = st.slider("Progress %", 0, 100, int(selected_task["progress_percent"] or 0))
-            existing_due = pd.to_datetime(selected_task["due_date"], errors="coerce")
-            edit_due = st.date_input("Due date", value=existing_due.date() if pd.notna(existing_due) else None)
-            edit_status = st.selectbox(
-                "Status",
-                STATUSES,
-                index=STATUSES.index(selected_task["status"]) if selected_task["status"] in STATUSES else 0,
-            )
-            edit_latest_update = st.text_area("Latest progress update", value=selected_task["latest_update"] or "")
-            edit_notes = st.text_area("Notes", value=selected_task["notes"] or "")
-            confirm_delete_task = st.checkbox("I confirm I want to permanently delete this task")
-
-            save_task = st.form_submit_button("Save task changes")
-            delete_task_btn = st.form_submit_button("Delete task")
-
-            if save_task and edit_title.strip() and edit_primary_owner:
-                supabase.table("tasks").update(
-                    {
-                        "title": edit_title.strip(),
-                        "project_id": task_project_map.get(edit_project_name),
-                        "owner_primary_id": task_user_map.get(edit_primary_owner),
-                        "owner_secondary_id": task_user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
-                        "progress_percent": edit_progress,
-                        "due_date": edit_due.isoformat() if edit_due else None,
-                        "status": edit_status,
-                        "latest_update": edit_latest_update.strip(),
-                        "notes": edit_notes.strip(),
-                    }
-                ).eq("id", int(selected_task["id"])).execute()
-                st.success("Task updated.")
-                st.rerun()
-
-            if delete_task_btn:
-                if not confirm_delete_task:
-                    st.error("Please check the confirmation box before deleting this task.")
-                else:
-                    delete_task(supabase, int(selected_task["id"]))
-                    st.success("Task deleted.")
-                    st.rerun()
+        render_home(projects_df, tasks_df)
 
 
 if __name__ == "__main__":
@@ -568,10 +638,3 @@ if __name__ == "__main__":
 #   notes text,
 #   updated_at timestamptz not null default now()
 # );
-#
-# Optional starter data:
-# insert into public.users (name) values ('Alice'), ('Bob'), ('Carol') on conflict do nothing;
-# insert into public.projects (name, description, status) values
-# ('Website Refresh', 'Internal website updates', 'In Progress'),
-# ('Q2 Campaign', 'Cross-team campaign planning', 'Not Started')
-# on conflict do nothing;
