@@ -382,6 +382,7 @@ def main() -> None:
                         PROJECT_STATUSES,
                         index=PROJECT_STATUSES.index(selected_project_row["status"]) if selected_project_row["status"] in PROJECT_STATUSES else 0,
                     )
+                    confirm_delete_project = st.checkbox("I confirm I want to permanently delete this project")
 
                     save_project = st.form_submit_button("Save project changes")
                     delete_project_btn = st.form_submit_button("Delete project")
@@ -399,9 +400,12 @@ def main() -> None:
                         st.rerun()
 
                     if delete_project_btn:
-                        delete_project(supabase, int(selected_project_row["id"]))
-                        st.success("Project deleted.")
-                        st.rerun()
+                        if not confirm_delete_project:
+                            st.error("Please check the confirmation box before deleting this project.")
+                        else:
+                            delete_project(supabase, int(selected_project_row["id"]))
+                            st.success("Project deleted.")
+                            st.rerun()
 
         with st.expander("Add Task"):
             with st.form("add_task_form", clear_on_submit=True):
@@ -444,6 +448,45 @@ def main() -> None:
         selected_task = task_options[selected_label]
 
         with st.form("edit_task_form"):
+            task_project_map = {row["name"]: row["id"] for _, row in projects_df.iterrows()} if not projects_df.empty else {}
+            task_user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
+
+            current_project_name = None
+            for name, pid in task_project_map.items():
+                if pid == selected_task["project_id"]:
+                    current_project_name = name
+                    break
+
+            current_primary_name = None
+            for name, uid in task_user_map.items():
+                if uid == selected_task["owner_primary_id"]:
+                    current_primary_name = name
+                    break
+
+            current_secondary_name = None
+            for name, uid in task_user_map.items():
+                if uid == selected_task["owner_secondary_id"]:
+                    current_secondary_name = name
+                    break
+
+            edit_title = st.text_input("Task title", value=selected_task["title"] or "")
+            edit_project_name = st.selectbox(
+                "Project",
+                [None] + list(task_project_map.keys()),
+                index=([None] + list(task_project_map.keys())).index(current_project_name) if current_project_name in ([None] + list(task_project_map.keys())) else 0,
+                format_func=lambda x: x or "None",
+            )
+            edit_primary_owner = st.selectbox(
+                "Primary owner",
+                list(task_user_map.keys()) if task_user_map else [None],
+                index=(list(task_user_map.keys()).index(current_primary_name) if current_primary_name in list(task_user_map.keys()) else 0) if task_user_map else 0,
+            )
+            edit_secondary_owner = st.selectbox(
+                "Secondary owner",
+                [None] + list(task_user_map.keys()),
+                index=([None] + list(task_user_map.keys())).index(current_secondary_name) if current_secondary_name in ([None] + list(task_user_map.keys())) else 0,
+                format_func=lambda x: x or "None",
+            )
             edit_progress = st.slider("Progress %", 0, 100, int(selected_task["progress_percent"] or 0))
             existing_due = pd.to_datetime(selected_task["due_date"], errors="coerce")
             edit_due = st.date_input("Due date", value=existing_due.date() if pd.notna(existing_due) else None)
@@ -454,27 +497,35 @@ def main() -> None:
             )
             edit_latest_update = st.text_area("Latest progress update", value=selected_task["latest_update"] or "")
             edit_notes = st.text_area("Notes", value=selected_task["notes"] or "")
+            confirm_delete_task = st.checkbox("I confirm I want to permanently delete this task")
 
             save_task = st.form_submit_button("Save task changes")
             delete_task_btn = st.form_submit_button("Delete task")
 
-            if save_task:
-                update_task(
-                    supabase,
-                    int(selected_task["id"]),
-                    edit_progress,
-                    edit_due.isoformat() if edit_due else None,
-                    edit_status,
-                    edit_latest_update.strip(),
-                    edit_notes.strip(),
-                )
+            if save_task and edit_title.strip() and edit_primary_owner:
+                supabase.table("tasks").update(
+                    {
+                        "title": edit_title.strip(),
+                        "project_id": task_project_map.get(edit_project_name),
+                        "owner_primary_id": task_user_map.get(edit_primary_owner),
+                        "owner_secondary_id": task_user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
+                        "progress_percent": edit_progress,
+                        "due_date": edit_due.isoformat() if edit_due else None,
+                        "status": edit_status,
+                        "latest_update": edit_latest_update.strip(),
+                        "notes": edit_notes.strip(),
+                    }
+                ).eq("id", int(selected_task["id"])).execute()
                 st.success("Task updated.")
                 st.rerun()
 
             if delete_task_btn:
-                delete_task(supabase, int(selected_task["id"]))
-                st.success("Task deleted.")
-                st.rerun()
+                if not confirm_delete_task:
+                    st.error("Please check the confirmation box before deleting this task.")
+                else:
+                    delete_task(supabase, int(selected_task["id"]))
+                    st.success("Task deleted.")
+                    st.rerun()
 
 
 if __name__ == "__main__":
