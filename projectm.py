@@ -929,6 +929,17 @@ def normalize_team_value(value: str | None) -> str | None:
     return stripped or None
 
 
+def get_clean_team_names(teams_df: pd.DataFrame) -> list[str]:
+    if teams_df.empty or "name" not in teams_df.columns:
+        return []
+    cleaned = []
+    for raw_value in teams_df["name"].tolist():
+        team_name = normalize_team_value(raw_value)
+        if team_name:
+            cleaned.append(team_name)
+    return sorted(set(cleaned), key=str.casefold)
+
+
 def status_badge(status: str | None) -> str:
     colors = {
         "Not Started": ("#f3f4f6", "#374151"),
@@ -1186,7 +1197,7 @@ def render_add_task_dialog(
 ) -> None:
     user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
     teams_table_missing = teams_df.attrs.get("missing_table", False)
-    team_names = sorted(teams_df["name"].dropna().tolist()) if "name" in teams_df.columns else []
+    team_names = get_clean_team_names(teams_df)
 
     with st.form("add_task_dialog_form", clear_on_submit=True):
         title = st.text_input("Task title")
@@ -1251,10 +1262,10 @@ def render_task_edit_dialog(
 ) -> None:
     user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
     teams_table_missing = teams_df.attrs.get("missing_table", False)
-    team_names = sorted(teams_df["name"].dropna().tolist()) if "name" in teams_df.columns else []
+    team_names = get_clean_team_names(teams_df)
     current_primary_name = next((name for name, uid in user_map.items() if uid == task_row["owner_primary_id"]), None)
     current_secondary_name = next((name for name, uid in user_map.items() if uid == task_row["owner_secondary_id"]), None)
-    current_team_name = task_row["team"] or ""
+    current_team_name = normalize_team_value(task_row["team"]) or ""
     existing_start = pd.to_datetime(task_row["start_date"], errors="coerce")
     existing_due = pd.to_datetime(task_row["due_date"], errors="coerce")
 
@@ -1267,7 +1278,10 @@ def render_task_edit_dialog(
                 help="Create a `teams` table to manage team values from Settings.",
             )
         else:
-            team_choices = [""] + sorted(set(team_names + ([current_team_name] if current_team_name else [])))
+            team_choices = [""] + sorted(
+                set(team_names + ([current_team_name] if current_team_name else [])),
+                key=str.casefold,
+            )
             edit_team = st.selectbox(
                 "Team",
                 team_choices,
@@ -1882,7 +1896,7 @@ def render_project_page(
     project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame()
     user_map = {row["name"]: row["id"] for _, row in users_df.iterrows()} if not users_df.empty else {}
     teams_table_missing = teams_df.attrs.get("missing_table", False)
-    team_names = sorted(teams_df["name"].dropna().tolist()) if "name" in teams_df.columns else []
+    team_names = get_clean_team_names(teams_df)
 
     back_col, title_col, action_col = st.columns([1, 4, 1])
 
@@ -2044,7 +2058,7 @@ def render_project_page(
 
             current_primary_name = next((name for name, uid in user_map.items() if uid == selected_task["owner_primary_id"]), None)
             current_secondary_name = next((name for name, uid in user_map.items() if uid == selected_task["owner_secondary_id"]), None)
-            current_team_name = selected_task["team"] or ""
+            current_team_name = normalize_team_value(selected_task["team"]) or ""
 
             with st.form("project_page_edit_task_form"):
                 edit_title = st.text_input("Task title", value=selected_task["title"] or "")
@@ -2055,7 +2069,10 @@ def render_project_page(
                         help="Create a `teams` table to manage team values from Settings.",
                     )
                 else:
-                    team_choices = [""] + sorted(set(team_names + ([current_team_name] if current_team_name else [])))
+                    team_choices = [""] + sorted(
+                        set(team_names + ([current_team_name] if current_team_name else [])),
+                        key=str.casefold,
+                    )
                     edit_team = st.selectbox(
                         "Team",
                         team_choices,
