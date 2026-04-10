@@ -15,6 +15,8 @@ import re
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from supabase import Client, create_client
 
 STATUSES = ["Not Started", "In Progress", "Blocked", "Done"]
@@ -37,6 +39,18 @@ TASK_COLUMNS = [
     "owner_primary_id",
     "owner_secondary_id",
 ]
+
+STATUS_COLORS = {
+    "Done": "C6EFD5",
+    "In Progress": "DCEBFF",
+    "Blocked": "FDE6D8",
+    "Not Started": "E5E7EB",
+    "Overdue": "FECACA",
+}
+
+HEADER_FILL = "1F4E78"
+HEADER_FONT_COLOR = "FFFFFF"
+BORDER_COLOR = "D1D5DB"
 
 
 # -------------------------
@@ -290,42 +304,506 @@ def delete_task(supabase: Client, task_id: int) -> None:
 # Export helpers
 # -------------------------
 
-def make_safe_sheet_name(name: str, used_names: set[str]) -> str:
-    safe = re.sub(r"[\\/*?:\[\]]", "_", str(name)).strip()
-    safe = safe.strip("'")
-    if not safe:
-        safe = "Project"
-    safe = safe[:31]
-
-    original = safe
-    counter = 2
-    while safe in used_names:
-        suffix = f"_{counter}"
-        safe = f"{original[:31-len(suffix)]}{suffix}"
-        counter += 1
-
-    used_names.add(safe)
-    return safe
+def safe_to_timestamp(value):
+    return pd.to_datetime(value, errors="coerce")
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+def infer_task_start_date_for_export(start_date_value, due_date_value, status):
+    start_ts = safe_to_timestamp(start_date_value)
+    if pd.notna(start_ts):
+        return start_ts
+
+    due_ts = safe_to_timestamp(due_date_value)
+    if pd.isna(due_ts):
+        return pd.NaT
+
+    if status == "Done":
+        return due_ts - pd.Timedelta(days=7)
+    if status == "In Progress":
+        return due_ts - pd.Timedelta(days=10)
+    if status == "Blocked":
+        return due_ts - pd.Timedelta(days=5)
+    return due_ts - pd.Timedelta(days=14)
+
+
+def start_of_week(ts: pd.Timestamp) -> pd.Timestamp:
+    ts = safe_to_timestamp(ts)
+    if pd.isna(ts):
+        return pd.NaT
+    return ts - pd.Timedelta(days=ts.weekday())
+
+
+def get_timeline_weeks(min_date, max_date):
+    min_ts = safe_to_timestamp(min_date)
+    max_ts = safe_to_timestamp(max_date)
+
+    if pd.isna(min_ts) or pd.isna(max_ts):
+        today_ts = pd.Timestamp(date.today())
+        min_ts = today_ts - pd.Timedelta(days=14)
+        max_ts = today_ts + pd.Timedelta(days=42)
+
+    min_ts = start_of_week(min_ts) - pd.Timedelta(weeks=1)
+    max_ts = start_of_week(max_ts) + pd.Timedelta(weeks=1)
+
+    weeks = []
+    current = min_ts
+    while current <= max_ts:
+        weeks.append(current)
+        current += pd.Timedelta(weeks=1)
+    return weeks
+
+
+def get_status_fill(status: str, overdue: bool = False) -> PatternFill:
+    color = STATUS_COLORS.get("Overdue") if overdue else STATUS_COLORS.get(status, STATUS_COLORS["Not Started"])
+    return PatternFill(fill_type="solid", start_color=color, end_color=color)
+
+
+def apply_header_style(cell) -> None:
+    cell.font = Font(bold=True, color=HEADER_FONT_COLOR)
+    cell.fill = PatternFill(fill_type="solid", start_color=HEADER_FILL, end_color=HEADER_FILL)
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell.border = Border(
+        left=Side(style="thin", color=BORDER_COLOR),
+        right=Side(style="thin", color=BORDER_COLOR),
+        top=Side(style="thin", color=BORDER_COLOR),
+        bottom=Side(style="thin", color=BORDER_COLOR),
+    )
+
+
+def apply_body_border(cell) -> None:
+    cell.border = Border(
+        left=Side(style="thin", color=BORDER_COLOR),
+        right=Side(style="thin", color=BORDER_COLOR),
+        top=Side(style="thin", color=BORDER_COLOR),
+        bottom=Side(style="thin", color=BORDER_COLOR),
+    )
+
+
+def autosize_columns(ws, min_width: int = 10, max_width: int = 36, skip_from_col: int | None = None) -> None:
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        if skip_from_col and col_idx >= skip_from_col:
+            ws.column_dimensions[get_column_letter(col_idx)].width = 4
+            continue
+
+        max_length = 0
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(min_width, min(max_length + 2, max_width))
+
+
+def prepare_task_export_df(tasks_df: pd.DataFrame) -> pd.DataFrame:
+    if tasks_df.empty:
+        return pd.DataFrame(columns=[
+            "Project", "Team", "Task", "Primary Owner", "Secondary Owner", "Status",
+            "Progress %", "Start Date", "Due Date", "Days Remaining", "Latest Update",
+            "_start_ts", "_due_ts", "_overdue"
+        ])
+
+    df = tasks_df.copy()
+    df["_due_ts"] = pd.to_datetime(df["due_date"], errors="coerce")
+    df["_start_ts"] = [
+        infer_task_start_date_for_export(start_date, due_date, status)
+        for start_date, due_date, status in zip(df.get("start_date"), df.get("due_date"), df.get("status"))
+    ]
+
+    today_ts = pd.Timestamp(date.today())
+    df["_overdue"] = (df["_due_ts"] < today_ts) & (df["status"] != "Done")
+
+    def days_remaining(row):
+        if pd.isna(row["_due_ts"]):
+            return ""
+        if row.get("status") == "Done":
+            return "Done"
+        return int((row["_due_ts"].date() - date.today()).days)
+
+    df["Days Remaining"] = df.apply(days_remaining, axis=1)
+
+    status_priority = {
+        "Blocked": 0,
+        "In Progress": 1,
+        "Not Started": 2,
+        "Done": 3,
+    }
+    df["_status_priority"] = df["status"].map(status_priority).fillna(9)
+    df = df.sort_values(["project", "_due_ts", "_status_priority", "title"], na_position="last")
+
+    export_df = pd.DataFrame({
+        "Project": df.get("project"),
+        "Team": df.get("team"),
+        "Task": df.get("title"),
+        "Primary Owner": df.get("owner_primary"),
+        "Secondary Owner": df.get("owner_secondary"),
+        "Status": df.get("status"),
+        "Progress %": df.get("progress_percent"),
+        "Start Date": df["_start_ts"].dt.date,
+        "Due Date": df["_due_ts"].dt.date,
+        "Days Remaining": df["Days Remaining"],
+        "Latest Update": df.get("latest_update"),
+        "_start_ts": df["_start_ts"],
+        "_due_ts": df["_due_ts"],
+        "_overdue": df["_overdue"],
+    })
+
+    return export_df
+
+
+def prepare_project_export_df(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> pd.DataFrame:
+    if projects_df.empty:
+        return pd.DataFrame(columns=[
+            "Project", "Project Status", "Project Due Date", "Total Tasks", "Open Tasks",
+            "Done Tasks", "Blocked Tasks", "Overdue Tasks", "Avg Progress %", "Teams Involved",
+            "Start Date", "Due Date", "Duration (Days)", "_start_ts", "_due_ts", "_overdue"
+        ])
+
+    task_df = tasks_df.copy() if not tasks_df.empty else pd.DataFrame(columns=TASK_COLUMNS)
+    task_df["_task_start_ts"] = pd.to_datetime(task_df.get("start_date"), errors="coerce")
+    task_df["_task_due_ts"] = pd.to_datetime(task_df.get("due_date"), errors="coerce")
+
+    prepared_rows = []
+    today_ts = pd.Timestamp(date.today())
+
+    for _, project in projects_df.iterrows():
+        project_name = project.get("name")
+        project_tasks = task_df[task_df.get("project") == project_name].copy() if not task_df.empty else pd.DataFrame()
+
+        total_tasks = len(project_tasks)
+        open_tasks = int((project_tasks.get("status") != "Done").sum()) if total_tasks else 0
+        done_tasks = int((project_tasks.get("status") == "Done").sum()) if total_tasks else 0
+        blocked_tasks = int((project_tasks.get("status") == "Blocked").sum()) if total_tasks else 0
+        overdue_tasks = int(((project_tasks.get("_task_due_ts") < today_ts) & (project_tasks.get("status") != "Done")).sum()) if total_tasks else 0
+
+        avg_progress = 0
+        if total_tasks:
+            avg_progress = int(round(pd.to_numeric(project_tasks.get("progress_percent"), errors="coerce").fillna(0).mean()))
+
+        teams_involved = ""
+        if total_tasks and "team" in project_tasks.columns:
+            teams = sorted({str(t).strip() for t in project_tasks["team"].dropna().tolist() if str(t).strip()})
+            teams_involved = ", ".join(teams)
+
+        explicit_project_due = pd.to_datetime(project.get("due_date"), errors="coerce")
+        task_due = project_tasks["_task_due_ts"].max() if total_tasks else pd.NaT
+        due_ts = explicit_project_due if pd.notna(explicit_project_due) else task_due
+
+        task_start_candidates = project_tasks["_task_start_ts"].dropna() if total_tasks else pd.Series(dtype="datetime64[ns]")
+        if not task_start_candidates.empty:
+            start_ts = task_start_candidates.min()
+        elif total_tasks and pd.notna(task_due):
+            start_ts = project_tasks["_task_due_ts"].min() - pd.Timedelta(days=14)
+        else:
+            start_ts = pd.NaT
+
+        duration_days = ""
+        if pd.notna(start_ts) and pd.notna(due_ts):
+            duration_days = int((due_ts - start_ts).days)
+
+        project_is_overdue = pd.notna(due_ts) and due_ts < today_ts and project.get("status") != "Done"
+
+        prepared_rows.append({
+            "Project": project_name,
+            "Project Status": project.get("status"),
+            "Project Due Date": explicit_project_due.date() if pd.notna(explicit_project_due) else "",
+            "Total Tasks": total_tasks,
+            "Open Tasks": open_tasks,
+            "Done Tasks": done_tasks,
+            "Blocked Tasks": blocked_tasks,
+            "Overdue Tasks": overdue_tasks,
+            "Avg Progress %": avg_progress,
+            "Teams Involved": teams_involved,
+            "Start Date": start_ts.date() if pd.notna(start_ts) else "",
+            "Due Date": due_ts.date() if pd.notna(due_ts) else "",
+            "Duration (Days)": duration_days,
+            "_start_ts": start_ts,
+            "_due_ts": due_ts,
+            "_overdue": project_is_overdue,
+        })
+
+    return pd.DataFrame(prepared_rows)
+
+
+def write_table_rows(ws, df: pd.DataFrame, start_row: int, start_col: int = 1, wrap_columns: set[int] | None = None) -> tuple[int, int]:
+    wrap_columns = wrap_columns or set()
+
+    for col_offset, column_name in enumerate(df.columns, start=0):
+        cell = ws.cell(row=start_row, column=start_col + col_offset, value=column_name)
+        apply_header_style(cell)
+
+    for row_offset, (_, row) in enumerate(df.iterrows(), start=1):
+        for col_offset, value in enumerate(row.tolist(), start=0):
+            cell = ws.cell(row=start_row + row_offset, column=start_col + col_offset, value=value)
+            apply_body_border(cell)
+            if (start_col + col_offset) in wrap_columns:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            else:
+                cell.alignment = Alignment(vertical="top")
+
+    end_row = start_row + len(df)
+    end_col = start_col + len(df.columns) - 1
+    return end_row, end_col
+
+
+def fill_weekly_timeline(ws, row_idx: int, start_date, due_date, timeline_start_col: int, weeks: list[pd.Timestamp], status: str, overdue: bool = False) -> None:
+    start_ts = safe_to_timestamp(start_date)
+    due_ts = safe_to_timestamp(due_date)
+    if pd.isna(start_ts) or pd.isna(due_ts):
+        return
+
+    fill = get_status_fill(status, overdue=overdue)
+
+    for idx, week_start in enumerate(weeks):
+        week_end = week_start + pd.Timedelta(days=6)
+        overlaps = not (due_ts < week_start or start_ts > week_end)
+        cell = ws.cell(row=row_idx, column=timeline_start_col + idx)
+        apply_body_border(cell)
+        if overlaps:
+            cell.fill = fill
+
+
+def build_tracker_excel_bytes(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> bytes:
     output = BytesIO()
-    export_df = df.copy()
+
+    project_export_df = prepare_project_export_df(projects_df, tasks_df)
+    task_export_df = prepare_task_export_df(tasks_df)
+
+    date_candidates = []
+    for df in [project_export_df, task_export_df]:
+        if not df.empty:
+            if "_start_ts" in df.columns:
+                date_candidates.extend(df["_start_ts"].dropna().tolist())
+            if "_due_ts" in df.columns:
+                date_candidates.extend(df["_due_ts"].dropna().tolist())
+
+    min_date = min(date_candidates) if date_candidates else pd.Timestamp(date.today()) - pd.Timedelta(days=14)
+    max_date = max(date_candidates) if date_candidates else pd.Timestamp(date.today()) + pd.Timedelta(days=42)
+    timeline_weeks = get_timeline_weeks(min_date, max_date)
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        used_names = set()
-        summary_name = make_safe_sheet_name("All Visible Tasks", used_names)
-        export_df.to_excel(writer, index=False, sheet_name=summary_name)
+        workbook = writer.book
+        if "Sheet" in workbook.sheetnames:
+            workbook.remove(workbook["Sheet"])
 
-        working_df = export_df[export_df["project"].notna()].copy()
-        if "status" in working_df.columns:
-            working_df = working_df[working_df["status"] != "Done"]
+        summary_ws = workbook.create_sheet("Summary")
+        project_ws = workbook.create_sheet("Project Timeline")
+        task_ws = workbook.create_sheet("Task Timeline")
 
-        if not working_df.empty:
-            for project_name in sorted(working_df["project"].dropna().unique()):
-                project_df = working_df[working_df["project"] == project_name].copy()
-                safe_sheet_name = make_safe_sheet_name(project_name, used_names)
-                project_df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+        today_ts = pd.Timestamp(date.today())
+        active_projects = int((projects_df["status"] != "Done").sum()) if not projects_df.empty and "status" in projects_df.columns else 0
+        archived_projects = int((projects_df["status"] == "Done").sum()) if not projects_df.empty and "status" in projects_df.columns else 0
+        total_tasks = len(tasks_df) if not tasks_df.empty else 0
+        open_tasks = int((tasks_df["status"] != "Done").sum()) if not tasks_df.empty and "status" in tasks_df.columns else 0
+        done_tasks = int((tasks_df["status"] == "Done").sum()) if not tasks_df.empty and "status" in tasks_df.columns else 0
+        blocked_tasks = int((tasks_df["status"] == "Blocked").sum()) if not tasks_df.empty and "status" in tasks_df.columns else 0
+
+        if not tasks_df.empty and "due_date" in tasks_df.columns and "status" in tasks_df.columns:
+            due_ts = pd.to_datetime(tasks_df["due_date"], errors="coerce")
+            overdue_tasks = int(((due_ts < today_ts) & (tasks_df["status"] != "Done")).sum())
+            due_this_week = int((((due_ts >= today_ts) & (due_ts <= today_ts + pd.Timedelta(days=7))) & (tasks_df["status"] != "Done")).sum())
+        else:
+            overdue_tasks = 0
+            due_this_week = 0
+
+        summary_ws["A1"] = "Project Tracker Summary"
+        summary_ws["A1"].font = Font(size=14, bold=True)
+
+        kpis = [
+            ("Total Active Projects", active_projects),
+            ("Total Archived Projects", archived_projects),
+            ("Total Tasks", total_tasks),
+            ("Open Tasks", open_tasks),
+            ("Done Tasks", done_tasks),
+            ("Overdue Tasks", overdue_tasks),
+            ("Blocked Tasks", blocked_tasks),
+            ("Due This Week", due_this_week),
+        ]
+
+        start_kpi_row = 3
+        for idx, (label, value) in enumerate(kpis):
+            r = start_kpi_row + idx
+            summary_ws.cell(row=r, column=1, value=label)
+            summary_ws.cell(row=r, column=2, value=value)
+            apply_body_border(summary_ws.cell(row=r, column=1))
+            apply_body_border(summary_ws.cell(row=r, column=2))
+            summary_ws.cell(row=r, column=1).font = Font(bold=True)
+
+        summary_table_df = project_export_df[[
+            "Project",
+            "Project Status",
+            "Project Due Date",
+            "Total Tasks",
+            "Open Tasks",
+            "Done Tasks",
+            "Blocked Tasks",
+            "Overdue Tasks",
+            "Avg Progress %",
+            "Teams Involved",
+        ]].copy() if not project_export_df.empty else pd.DataFrame(columns=[
+            "Project",
+            "Project Status",
+            "Project Due Date",
+            "Total Tasks",
+            "Open Tasks",
+            "Done Tasks",
+            "Blocked Tasks",
+            "Overdue Tasks",
+            "Avg Progress %",
+            "Teams Involved",
+        ])
+
+        summary_table_start_row = start_kpi_row + len(kpis) + 2
+        summary_ws.cell(row=summary_table_start_row - 1, column=1, value="Project Summary")
+        summary_ws.cell(row=summary_table_start_row - 1, column=1).font = Font(size=12, bold=True)
+
+        end_row, _ = write_table_rows(summary_ws, summary_table_df, summary_table_start_row)
+
+        if not summary_table_df.empty:
+            status_col_idx = list(summary_table_df.columns).index("Project Status") + 1
+            overdue_col_idx = list(summary_table_df.columns).index("Overdue Tasks") + 1
+            for row_idx in range(summary_table_start_row + 1, end_row + 1):
+                status_cell = summary_ws.cell(row=row_idx, column=status_col_idx)
+                overdue_count = summary_ws.cell(row=row_idx, column=overdue_col_idx).value or 0
+                status_value = status_cell.value
+                status_cell.fill = get_status_fill(status_value, overdue=bool(overdue_count and status_value != "Done"))
+
+        if end_row >= summary_table_start_row:
+            summary_ws.auto_filter.ref = f"A{summary_table_start_row}:J{end_row}"
+            summary_ws.freeze_panes = f"A{summary_table_start_row + 1}"
+
+        autosize_columns(summary_ws)
+
+        project_ws["A1"] = "Project Timeline"
+        project_ws["A1"].font = Font(size=14, bold=True)
+
+        project_meta_df = project_export_df[[
+            "Project",
+            "Project Status",
+            "Start Date",
+            "Due Date",
+            "Duration (Days)",
+            "Avg Progress %",
+            "Open Tasks",
+            "Blocked Tasks",
+            "Overdue Tasks",
+        ]].copy() if not project_export_df.empty else pd.DataFrame(columns=[
+            "Project",
+            "Project Status",
+            "Start Date",
+            "Due Date",
+            "Duration (Days)",
+            "Avg Progress %",
+            "Open Tasks",
+            "Blocked Tasks",
+            "Overdue Tasks",
+        ])
+
+        project_header_row = 3
+        timeline_start_col = len(project_meta_df.columns) + 2
+        write_table_rows(project_ws, project_meta_df, project_header_row)
+
+        for idx, week_start in enumerate(timeline_weeks):
+            cell = project_ws.cell(row=project_header_row, column=timeline_start_col + idx, value=week_start.date().isoformat())
+            apply_header_style(cell)
+
+        if not project_export_df.empty:
+            for row_num, (_, row) in enumerate(project_export_df.iterrows(), start=project_header_row + 1):
+                status_value = row.get("Project Status")
+                overdue_value = bool(row.get("_overdue"))
+                status_col_idx = list(project_meta_df.columns).index("Project Status") + 1
+                project_ws.cell(row=row_num, column=status_col_idx).fill = get_status_fill(status_value, overdue=overdue_value)
+
+                fill_weekly_timeline(
+                    project_ws,
+                    row_num,
+                    row.get("_start_ts"),
+                    row.get("_due_ts"),
+                    timeline_start_col,
+                    timeline_weeks,
+                    status=status_value,
+                    overdue=overdue_value,
+                )
+
+        legend_row = 2
+        legend_items = ["Done", "In Progress", "Not Started", "Blocked", "Overdue"]
+        legend_start_col = timeline_start_col
+        for idx, label in enumerate(legend_items):
+            cell = project_ws.cell(row=legend_row, column=legend_start_col + idx, value=label)
+            cell.fill = get_status_fill(label, overdue=(label == "Overdue"))
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+            apply_body_border(cell)
+
+        if not project_meta_df.empty:
+            project_ws.auto_filter.ref = f"A{project_header_row}:I{project_header_row + len(project_meta_df)}"
+        project_ws.freeze_panes = f"A{project_header_row + 1}"
+        autosize_columns(project_ws, skip_from_col=timeline_start_col)
+
+        task_ws["A1"] = "Task Timeline"
+        task_ws["A1"].font = Font(size=14, bold=True)
+
+        task_meta_df = task_export_df[[
+            "Project",
+            "Team",
+            "Task",
+            "Primary Owner",
+            "Secondary Owner",
+            "Status",
+            "Progress %",
+            "Start Date",
+            "Due Date",
+            "Days Remaining",
+            "Latest Update",
+        ]].copy() if not task_export_df.empty else pd.DataFrame(columns=[
+            "Project",
+            "Team",
+            "Task",
+            "Primary Owner",
+            "Secondary Owner",
+            "Status",
+            "Progress %",
+            "Start Date",
+            "Due Date",
+            "Days Remaining",
+            "Latest Update",
+        ])
+
+        task_header_row = 3
+        task_timeline_start_col = len(task_meta_df.columns) + 2
+        latest_update_col_idx = list(task_meta_df.columns).index("Latest Update") + 1
+        write_table_rows(task_ws, task_meta_df, task_header_row, wrap_columns={latest_update_col_idx})
+
+        for idx, week_start in enumerate(timeline_weeks):
+            cell = task_ws.cell(row=task_header_row, column=task_timeline_start_col + idx, value=week_start.date().isoformat())
+            apply_header_style(cell)
+
+        if not task_export_df.empty:
+            status_col_idx = list(task_meta_df.columns).index("Status") + 1
+            for row_num, (_, row) in enumerate(task_export_df.iterrows(), start=task_header_row + 1):
+                status_value = row.get("Status")
+                overdue_value = bool(row.get("_overdue"))
+                task_ws.cell(row=row_num, column=status_col_idx).fill = get_status_fill(status_value, overdue=overdue_value)
+
+                fill_weekly_timeline(
+                    task_ws,
+                    row_num,
+                    row.get("_start_ts"),
+                    row.get("_due_ts"),
+                    task_timeline_start_col,
+                    timeline_weeks,
+                    status=status_value,
+                    overdue=overdue_value,
+                )
+
+        for idx, label in enumerate(legend_items):
+            cell = task_ws.cell(row=2, column=task_timeline_start_col + idx, value=label)
+            cell.fill = get_status_fill(label, overdue=(label == "Overdue"))
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+            apply_body_border(cell)
+
+        if not task_meta_df.empty:
+            task_ws.auto_filter.ref = f"A{task_header_row}:K{task_header_row + len(task_meta_df)}"
+        task_ws.freeze_panes = f"A{task_header_row + 1}"
+        autosize_columns(task_ws, skip_from_col=task_timeline_start_col)
 
     output.seek(0)
     return output.getvalue()
@@ -1669,6 +2147,7 @@ def render_settings(
     supabase: Client,
     users_df: pd.DataFrame,
     teams_df: pd.DataFrame,
+    projects_df: pd.DataFrame,
     tasks_df: pd.DataFrame,
 ) -> None:
     back_col, title_col = st.columns([1, 5])
@@ -1785,13 +2264,20 @@ def render_settings(
                 st.dataframe(teams_df, use_container_width=True, hide_index=True)
 
     with tab_exports:
-        st.markdown("#### Export visible task data")
-        if tasks_df.empty:
-            st.info("No task data available to export.")
+        st.markdown("#### Export project tracker workbook")
+        if projects_df.empty and tasks_df.empty:
+            st.info("No project or task data available to export.")
         else:
-            export_df = tasks_df[
+            excel_bytes = build_tracker_excel_bytes(projects_df, tasks_df)
+            st.download_button(
+                label="Export to Excel",
+                data=excel_bytes,
+                file_name="project_tracker_timeline_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            preview_df = tasks_df[
                 [
-                    "id",
                     "project",
                     "team",
                     "title",
@@ -1802,18 +2288,12 @@ def render_settings(
                     "due_date",
                     "status",
                     "latest_update",
-                    "notes",
-                    "updated_at",
                 ]
-            ].copy()
-            excel_bytes = dataframe_to_excel_bytes(export_df)
-            st.download_button(
-                label="Export to Excel",
-                data=excel_bytes,
-                file_name="project_tracker_projects_export.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            st.dataframe(export_df, use_container_width=True, hide_index=True)
+            ].copy() if not tasks_df.empty else pd.DataFrame()
+
+            if not preview_df.empty:
+                st.caption("Preview of task data included in the workbook")
+                st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
 
 # -------------------------
@@ -1849,7 +2329,7 @@ def main() -> None:
 
     page = st.session_state.get("page", "Home")
     if page == "Settings":
-        render_settings(supabase, users_df, teams_df, tasks_df)
+        render_settings(supabase, users_df, teams_df, projects_df, tasks_df)
     elif page == "Archived":
         render_archived_projects(projects_df, tasks_df)
     elif page == "Project":
