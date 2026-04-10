@@ -136,6 +136,16 @@ def add_user(supabase: Client, name: str) -> None:
     supabase.table("users").insert({"name": name}).execute()
 
 
+def update_user(supabase: Client, user_id: int, name: str) -> None:
+    supabase.table("users").update({"name": name}).eq("id", user_id).execute()
+
+
+def delete_user(supabase: Client, user_id: int) -> None:
+    supabase.table("tasks").update({"owner_primary_id": None}).eq("owner_primary_id", user_id).execute()
+    supabase.table("tasks").update({"owner_secondary_id": None}).eq("owner_secondary_id", user_id).execute()
+    supabase.table("users").delete().eq("id", user_id).execute()
+
+
 def add_team(supabase: Client, name: str) -> None:
     supabase.table("teams").insert({"name": name}).execute()
 
@@ -612,13 +622,24 @@ def task_payload_from_form(
 
 
 def render_top_bar() -> None:
-    top_left, top_right = st.columns([6, 1])
+    top_left, nav_home, nav_archived, nav_settings = st.columns([5, 1, 1, 1])
     with top_left:
         st.title("Project Tracker")
         st.caption("Internal project visibility dashboard")
-    with top_right:
-        if st.button("⚙️", help="Open settings", use_container_width=True):
+    with nav_home:
+        if st.button("Home", use_container_width=True):
+            st.session_state["page"] = "Home"
+            st.session_state["active_dialog"] = None
+            st.rerun()
+    with nav_archived:
+        if st.button("Archived", use_container_width=True):
+            st.session_state["page"] = "Archived"
+            st.session_state["active_dialog"] = None
+            st.rerun()
+    with nav_settings:
+        if st.button("Settings", use_container_width=True):
             st.session_state["page"] = "Settings"
+            st.session_state["active_dialog"] = None
             st.rerun()
 
 
@@ -637,6 +658,7 @@ def render_project_edit_dialog(supabase: Client, project_row: pd.Series) -> None
             PROJECT_STATUSES,
             index=PROJECT_STATUSES.index(project_row["status"]) if project_row["status"] in PROJECT_STATUSES else 0,
         )
+        st.caption("Projects marked as Done are moved to Archived automatically.")
         st.divider()
         confirm_delete_project = st.checkbox("I confirm I want to permanently delete this project")
 
@@ -653,6 +675,11 @@ def render_project_edit_dialog(supabase: Client, project_row: pd.Series) -> None
                 edit_project_status,
             )
             st.session_state["active_dialog"] = None
+            if edit_project_status == "Done":
+                st.session_state["page"] = "Archived"
+                st.session_state["selected_project_id"] = None
+            else:
+                st.session_state["page"] = "Project"
             st.success("Project updated.")
             st.rerun()
 
@@ -891,6 +918,54 @@ def render_home_recent_updates(tasks_df: pd.DataFrame, limit: int = 8) -> None:
             st.write(task.get("latest_update") or "No update text yet.")
 
 
+def render_project_cards(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+    if projects_df.empty:
+        st.info("No projects available.")
+        return
+
+    project_cards = []
+    for _, project in projects_df.iterrows():
+        project_name = project.get("name")
+        project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame(columns=TASK_COLUMNS)
+        project_cards.append(
+            {
+                "id": project.get("id"),
+                "name": project_name,
+                "status": project.get("status"),
+                "progress": project_progress(project_tasks),
+                "total_tasks": len(project_tasks),
+                "blocked_tasks": int((project_tasks["status"] == "Blocked").sum()) if not project_tasks.empty else 0,
+                "overdue_tasks": int(project_tasks.apply(task_is_overdue, axis=1).sum()) if not project_tasks.empty else 0,
+            }
+        )
+
+    for start in range(0, len(project_cards), 3):
+        cols = st.columns(3)
+        for col, card in zip(cols, project_cards[start:start + 3]):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"### {card['name']}")
+                    st.markdown(project_status_badge(card["status"]), unsafe_allow_html=True)
+                    st.progress(card["progress"] / 100, text=f"{card['progress']}% complete")
+                    metric_cols = st.columns(3)
+                    metric_cols[0].metric("Tasks", card["total_tasks"])
+                    metric_cols[1].metric("Overdue", card["overdue_tasks"])
+                    metric_cols[2].metric("Blocked", card["blocked_tasks"])
+                    if st.button("Open project", key=f"open_project_{card['id']}", use_container_width=True):
+                        st.session_state["selected_project_id"] = int(card["id"])
+                        st.session_state["selected_task_id"] = None
+                        st.session_state["active_dialog"] = None
+                        st.session_state["page"] = "Project"
+                        st.rerun()
+
+
+def render_archived_projects(projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
+    st.subheader("Archived Projects")
+    st.caption("Projects with status Done are archived here.")
+    archived_df = projects_df[projects_df["status"] == "Done"].copy() if not projects_df.empty else pd.DataFrame()
+    render_project_cards(archived_df, tasks_df)
+
+
 def render_home_v2(supabase: Client, projects_df: pd.DataFrame, tasks_df: pd.DataFrame) -> None:
     top_left, top_right = st.columns([5, 1])
 
@@ -953,43 +1028,8 @@ def render_home_v2(supabase: Client, projects_df: pd.DataFrame, tasks_df: pd.Dat
     render_workload_summary(tasks_df)
 
     st.markdown("#### Projects")
-    if projects_df.empty:
-        st.info("No projects available yet.")
-    else:
-        project_cards = []
-        for _, project in projects_df.iterrows():
-            project_name = project.get("name")
-            project_tasks = tasks_df[tasks_df["project"] == project_name].copy() if not tasks_df.empty else pd.DataFrame(columns=TASK_COLUMNS)
-            project_cards.append(
-                {
-                    "id": project.get("id"),
-                    "name": project_name,
-                    "status": project.get("status"),
-                    "progress": project_progress(project_tasks),
-                    "total_tasks": len(project_tasks),
-                    "blocked_tasks": int((project_tasks["status"] == "Blocked").sum()) if not project_tasks.empty else 0,
-                    "overdue_tasks": int(project_tasks.apply(task_is_overdue, axis=1).sum()) if not project_tasks.empty else 0,
-                }
-            )
-
-        for start in range(0, len(project_cards), 3):
-            cols = st.columns(3)
-            for col, card in zip(cols, project_cards[start:start + 3]):
-                with col:
-                    with st.container(border=True):
-                        st.markdown(f"### {card['name']}")
-                        st.markdown(project_status_badge(card["status"]), unsafe_allow_html=True)
-                        st.progress(card["progress"] / 100, text=f"{card['progress']}% complete")
-                        metric_cols = st.columns(3)
-                        metric_cols[0].metric("Tasks", card["total_tasks"])
-                        metric_cols[1].metric("Overdue", card["overdue_tasks"])
-                        metric_cols[2].metric("Blocked", card["blocked_tasks"])
-                        if st.button("Open project", key=f"open_project_{card['id']}", use_container_width=True):
-                            st.session_state["selected_project_id"] = int(card["id"])
-                            st.session_state["selected_task_id"] = None
-                            st.session_state["active_dialog"] = None
-                            st.session_state["page"] = "Project"
-                            st.rerun()
+    active_projects_df = projects_df[projects_df["status"] != "Done"].copy() if not projects_df.empty else pd.DataFrame()
+    render_project_cards(active_projects_df, tasks_df)
 
     st.markdown("#### Recent updates")
     render_home_recent_updates(tasks_df, limit=8)
@@ -1003,7 +1043,7 @@ def render_home(supabase: Client, projects_df: pd.DataFrame, tasks_df: pd.DataFr
         st.write("Select a project to review its details.")
 
     with top_right:
-        with st.popover("＋ Add Project", use_container_width=True):
+        with st.popover("嚗?Add Project", use_container_width=True):
             with st.form("home_add_project_form", clear_on_submit=True):
                 project_name = st.text_input("Project name")
                 project_description = st.text_area("Description")
@@ -1056,8 +1096,8 @@ def render_home(supabase: Client, projects_df: pd.DataFrame, tasks_df: pd.DataFr
             with col:
                 with st.container(border=True):
                     st.markdown(f"### {card['name']}")
-                    st.write(f"**Status:** {card['status'] or '—'}")
-                    st.write(f"**Due date:** {card['due_date'] or '—'}")
+                    st.write(f"**Status:** {card['status'] or '-'}")
+                    st.write(f"**Due date:** {card['due_date'] or '-'}")
                     st.write(f"**Tasks:** {card['total_tasks']}")
                     st.write(f"**Blocked:** {card['blocked_tasks']}")
                     st.write(f"**Overdue:** {card['overdue_tasks']}")
@@ -1369,7 +1409,7 @@ def render_project_page(
     back_col, title_col, action_col = st.columns([1, 4, 1])
 
     with back_col:
-        if st.button("← Back", use_container_width=True):
+        if st.button("??Back", use_container_width=True):
             st.session_state["page"] = "Home"
             st.session_state["task_mode"] = None
             st.session_state["project_edit_mode"] = False
@@ -1380,7 +1420,7 @@ def render_project_page(
         st.caption(project_row.get("description", "") or "Project detail view")
 
     with action_col:
-        if st.button("⚙️ Edit", use_container_width=True):
+        if st.button("?? Edit", use_container_width=True):
             st.session_state["project_edit_mode"] = not st.session_state.get("project_edit_mode", False)
             st.rerun()
 
@@ -1388,21 +1428,21 @@ def render_project_page(
     info1.metric("Tasks", len(project_tasks))
     info2.metric("Blocked", len(project_tasks[project_tasks["status"] == "Blocked"]) if not project_tasks.empty else 0)
     info3.metric("Done", len(project_tasks[project_tasks["status"] == "Done"]) if not project_tasks.empty else 0)
-    info4.metric("Due date", project_row["due_date"] or "—")
+    info4.metric("Due date", project_row["due_date"] or "-")
 
     st.divider()
 
     task_action_col1, task_action_col2, task_action_col3 = st.columns(3)
     with task_action_col1:
-        if st.button("＋ Add Task", use_container_width=True):
+        if st.button("嚗?Add Task", use_container_width=True):
             st.session_state["task_mode"] = "add"
             st.rerun()
     with task_action_col2:
-        if st.button("✏️ Edit Task", use_container_width=True):
+        if st.button("?? Edit Task", use_container_width=True):
             st.session_state["task_mode"] = "edit"
             st.rerun()
     with task_action_col3:
-        if st.button("🗑️ Delete Task", use_container_width=True):
+        if st.button("??儭?Delete Task", use_container_width=True):
             st.session_state["task_mode"] = "delete"
             st.rerun()
 
@@ -1633,7 +1673,7 @@ def render_settings(
 ) -> None:
     back_col, title_col = st.columns([1, 5])
     with back_col:
-        if st.button("← Home", use_container_width=True):
+        if st.button("??Home", use_container_width=True):
             st.session_state["page"] = "Home"
             st.rerun()
     with title_col:
@@ -1652,10 +1692,35 @@ def render_settings(
                 st.success("User added.")
                 st.rerun()
 
-        st.markdown("#### Current users")
+        st.markdown("#### Edit or delete user")
         if users_df.empty:
             st.info("No users available.")
         else:
+            user_options = {f"#{row['id']} - {row['name']}": row for _, row in users_df.iterrows()}
+            selected_label = st.selectbox("Select user", list(user_options.keys()), key="settings_user_editor")
+            selected_user = user_options[selected_label]
+
+            with st.form("edit_user_form"):
+                edit_user_name = st.text_input("User name", value=selected_user["name"] or "")
+                confirm_delete_user = st.checkbox("I confirm I want to permanently delete this user")
+                save_user = st.form_submit_button("Save user changes")
+                delete_user_btn = st.form_submit_button("Delete user")
+
+                if save_user and edit_user_name.strip():
+                    update_user(supabase, int(selected_user["id"]), edit_user_name.strip())
+                    st.success("User updated.")
+                    st.rerun()
+
+                if delete_user_btn:
+                    if not confirm_delete_user:
+                        st.error("Please check the confirmation box before deleting this user.")
+                    else:
+                        delete_user(supabase, int(selected_user["id"]))
+                        st.success("User deleted.")
+                        st.rerun()
+
+        if not users_df.empty:
+            st.markdown("#### Current users")
             st.dataframe(users_df, use_container_width=True, hide_index=True)
 
     with tab_teams:
@@ -1785,6 +1850,8 @@ def main() -> None:
     page = st.session_state.get("page", "Home")
     if page == "Settings":
         render_settings(supabase, users_df, teams_df, tasks_df)
+    elif page == "Archived":
+        render_archived_projects(projects_df, tasks_df)
     elif page == "Project":
         render_project_page_v2(supabase, projects_df, tasks_df, users_df, teams_df)
     else:
