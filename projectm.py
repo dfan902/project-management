@@ -64,30 +64,29 @@ def fetch_projects(supabase: Client) -> pd.DataFrame:
 
 
 def fetch_tasks(supabase: Client) -> pd.DataFrame:
-    response = (
-        supabase.table("tasks")
-        .select(
-            """
-            id,
-            title,
-            team,
-            progress_percent,
-            due_date,
-            status,
-            latest_update,
-            notes,
-            updated_at,
-            project_id,
-            owner_primary_id,
-            owner_secondary_id,
-            projects(name),
-            owner_primary:users!tasks_owner_primary_id_fkey(name),
-            owner_secondary:users!tasks_owner_secondary_id_fkey(name)
-            """
-        )
-        .order("due_date", desc=False)
-        .execute()
-    )
+    task_select = """
+        id,
+        title,
+        team,
+        progress_percent,
+        start_date,
+        due_date,
+        status,
+        latest_update,
+        notes,
+        updated_at,
+        project_id,
+        owner_primary_id,
+        owner_secondary_id,
+        projects(name),
+        owner_primary:users!tasks_owner_primary_id_fkey(name),
+        owner_secondary:users!tasks_owner_secondary_id_fkey(name)
+    """
+    try:
+        response = supabase.table("tasks").select(task_select).order("due_date", desc=False).execute()
+    except Exception:
+        fallback_select = task_select.replace("        start_date,\n", "")
+        response = supabase.table("tasks").select(fallback_select).order("due_date", desc=False).execute()
 
     rows = []
     for item in (response.data or []):
@@ -100,6 +99,7 @@ def fetch_tasks(supabase: Client) -> pd.DataFrame:
                 "owner_primary": (item.get("owner_primary") or {}).get("name"),
                 "owner_secondary": (item.get("owner_secondary") or {}).get("name"),
                 "progress_percent": item.get("progress_percent"),
+                "start_date": item.get("start_date"),
                 "due_date": item.get("due_date"),
                 "status": item.get("status"),
                 "latest_update": item.get("latest_update"),
@@ -175,25 +175,30 @@ def add_task(
     owner_primary_id: int | None,
     owner_secondary_id: int | None,
     progress_percent: int,
+    start_date: str | None,
     due_date: str | None,
     status: str,
     latest_update: str,
     notes: str,
 ) -> None:
-    supabase.table("tasks").insert(
-        {
-            "title": title,
-            "team": team,
-            "project_id": project_id,
-            "owner_primary_id": owner_primary_id,
-            "owner_secondary_id": owner_secondary_id,
-            "progress_percent": progress_percent,
-            "due_date": due_date,
-            "status": status,
-            "latest_update": latest_update,
-            "notes": notes,
-        }
-    ).execute()
+    try:
+        supabase.table("tasks").insert(
+            {
+                "title": title,
+                "team": team,
+                "project_id": project_id,
+                "owner_primary_id": owner_primary_id,
+                "owner_secondary_id": owner_secondary_id,
+                "progress_percent": progress_percent,
+                "start_date": start_date,
+                "due_date": due_date,
+                "status": status,
+                "latest_update": latest_update,
+                "notes": notes,
+            }
+        ).execute()
+    except Exception as exc:
+        raise RuntimeError("Task start dates require the `start_date` column in Supabase.") from exc
 
 
 def update_task_full(
@@ -205,25 +210,30 @@ def update_task_full(
     owner_primary_id: int | None,
     owner_secondary_id: int | None,
     progress_percent: int,
+    start_date: str | None,
     due_date: str | None,
     status: str,
     latest_update: str,
     notes: str,
 ) -> None:
-    supabase.table("tasks").update(
-        {
-            "title": title,
-            "team": team,
-            "project_id": project_id,
-            "owner_primary_id": owner_primary_id,
-            "owner_secondary_id": owner_secondary_id,
-            "progress_percent": progress_percent,
-            "due_date": due_date,
-            "status": status,
-            "latest_update": latest_update,
-            "notes": notes,
-        }
-    ).eq("id", task_id).execute()
+    try:
+        supabase.table("tasks").update(
+            {
+                "title": title,
+                "team": team,
+                "project_id": project_id,
+                "owner_primary_id": owner_primary_id,
+                "owner_secondary_id": owner_secondary_id,
+                "progress_percent": progress_percent,
+                "start_date": start_date,
+                "due_date": due_date,
+                "status": status,
+                "latest_update": latest_update,
+                "notes": notes,
+            }
+        ).eq("id", task_id).execute()
+    except Exception as exc:
+        raise RuntimeError("Task start dates require the `start_date` column in Supabase.") from exc
 
 
 def delete_task(supabase: Client, task_id: int) -> None:
@@ -284,6 +294,9 @@ def prepare_project_timeline_df(project_tasks: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = project_tasks.copy()
+    if "start_date" not in df.columns:
+        df["start_date"] = pd.NaT
+    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
     df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
     today = pd.Timestamp(date.today())
 
@@ -301,7 +314,8 @@ def prepare_project_timeline_df(project_tasks: pd.DataFrame) -> pd.DataFrame:
             return due - timedelta(days=5)
         return due - timedelta(days=14)
 
-    df["start_date"] = df.apply(infer_start, axis=1)
+    inferred_start = df.apply(infer_start, axis=1)
+    df["start_date"] = df["start_date"].fillna(inferred_start)
     df["task_label"] = df["title"]
     return df
 
@@ -475,6 +489,7 @@ def render_project_updates(project_tasks: pd.DataFrame) -> None:
             "team",
             "title",
             "owner_primary",
+            "start_date",
             "due_date",
             "status",
             "latest_update",
@@ -487,6 +502,7 @@ def render_project_updates(project_tasks: pd.DataFrame) -> None:
             "team": "Team",
             "title": "Task",
             "owner_primary": "Owner",
+            "start_date": "Start Date",
             "due_date": "Due Date",
             "status": "Status",
             "latest_update": "Update",
@@ -613,7 +629,13 @@ def render_project_page(
 
     if task_mode == "add":
         st.divider()
-        st.markdown("#### Add task to this project")
+        add_title_col, add_back_col = st.columns([5, 1])
+        with add_title_col:
+            st.markdown("#### Add task to this project")
+        with add_back_col:
+            if st.button("Back to project", key="back_from_add_task", use_container_width=True):
+                st.session_state["task_mode"] = None
+                st.rerun()
 
         with st.form("project_page_add_task_form", clear_on_submit=True):
             title = st.text_input("Task title")
@@ -628,6 +650,7 @@ def render_project_page(
             selected_primary = st.selectbox("Primary owner", list(user_map.keys()) if user_map else [None])
             selected_secondary = st.selectbox("Secondary owner", [None] + list(user_map.keys()), format_func=lambda x: x or "None")
             progress_percent = st.slider("Progress %", 0, 100, 0)
+            start_date = st.date_input("Start date", value=None)
             due_date = st.date_input("Due date", value=None)
             status = st.selectbox("Status", STATUSES)
             latest_update = st.text_area("Latest progress update")
@@ -635,25 +658,36 @@ def render_project_page(
 
             submitted = st.form_submit_button("Create task")
             if submitted and title.strip() and selected_primary:
-                add_task(
-                    supabase,
-                    title.strip(),
-                    team.strip() if isinstance(team, str) else (team or None),
-                    int(project_row["id"]),
-                    user_map.get(selected_primary),
-                    user_map.get(selected_secondary) if selected_secondary else None,
-                    progress_percent,
-                    due_date.isoformat() if due_date else None,
-                    status,
-                    latest_update.strip(),
-                    notes.strip(),
-                )
-                st.success("Task created.")
-                st.rerun()
+                try:
+                    add_task(
+                        supabase,
+                        title.strip(),
+                        team.strip() if isinstance(team, str) else (team or None),
+                        int(project_row["id"]),
+                        user_map.get(selected_primary),
+                        user_map.get(selected_secondary) if selected_secondary else None,
+                        progress_percent,
+                        start_date.isoformat() if start_date else None,
+                        due_date.isoformat() if due_date else None,
+                        status,
+                        latest_update.strip(),
+                        notes.strip(),
+                    )
+                except RuntimeError as exc:
+                    st.error(f"{exc} Run: `alter table public.tasks add column if not exists start_date date;`")
+                else:
+                    st.success("Task created.")
+                    st.rerun()
 
     if task_mode == "edit":
         st.divider()
-        st.markdown("#### Edit task")
+        edit_title_col, edit_back_col = st.columns([5, 1])
+        with edit_title_col:
+            st.markdown("#### Edit task")
+        with edit_back_col:
+            if st.button("Back to project", key="back_from_edit_task", use_container_width=True):
+                st.session_state["task_mode"] = None
+                st.rerun()
 
         if project_tasks.empty:
             st.info("No tasks available in this project.")
@@ -696,6 +730,8 @@ def render_project_page(
                     format_func=lambda x: x or "None",
                 )
                 edit_progress = st.slider("Progress %", 0, 100, int(selected_task["progress_percent"] or 0))
+                existing_start = pd.to_datetime(selected_task["start_date"], errors="coerce")
+                edit_start = st.date_input("Start date", value=existing_start.date() if pd.notna(existing_start) else None)
                 existing_due = pd.to_datetime(selected_task["due_date"], errors="coerce")
                 edit_due = st.date_input("Due date", value=existing_due.date() if pd.notna(existing_due) else None)
                 edit_status = st.selectbox(
@@ -708,22 +744,27 @@ def render_project_page(
 
                 save_task = st.form_submit_button("Save task changes")
                 if save_task and edit_title.strip() and edit_primary_owner:
-                    update_task_full(
-                        supabase,
-                        int(selected_task["id"]),
-                        edit_title.strip(),
-                        edit_team.strip() if isinstance(edit_team, str) else (edit_team or None),
-                        int(project_row["id"]),
-                        user_map.get(edit_primary_owner),
-                        user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
-                        edit_progress,
-                        edit_due.isoformat() if edit_due else None,
-                        edit_status,
-                        edit_latest_update.strip(),
-                        edit_notes.strip(),
-                    )
-                    st.success("Task updated.")
-                    st.rerun()
+                    try:
+                        update_task_full(
+                            supabase,
+                            int(selected_task["id"]),
+                            edit_title.strip(),
+                            edit_team.strip() if isinstance(edit_team, str) else (edit_team or None),
+                            int(project_row["id"]),
+                            user_map.get(edit_primary_owner),
+                            user_map.get(edit_secondary_owner) if edit_secondary_owner else None,
+                            edit_progress,
+                            edit_start.isoformat() if edit_start else None,
+                            edit_due.isoformat() if edit_due else None,
+                            edit_status,
+                            edit_latest_update.strip(),
+                            edit_notes.strip(),
+                        )
+                    except RuntimeError as exc:
+                        st.error(f"{exc} Run: `alter table public.tasks add column if not exists start_date date;`")
+                    else:
+                        st.success("Task updated.")
+                        st.rerun()
 
     if task_mode == "delete":
         st.divider()
@@ -864,6 +905,7 @@ def render_settings(
                     "owner_primary",
                     "owner_secondary",
                     "progress_percent",
+                    "start_date",
                     "due_date",
                     "status",
                     "latest_update",
@@ -954,6 +996,7 @@ if __name__ == "__main__":
 #   owner_primary_id bigint references public.users(id) on delete set null,
 #   owner_secondary_id bigint references public.users(id) on delete set null,
 #   progress_percent integer not null default 0 check (progress_percent >= 0 and progress_percent <= 100),
+#   start_date date,
 #   due_date date,
 #   status text not null default 'Not Started',
 #   latest_update text,
@@ -963,3 +1006,4 @@ if __name__ == "__main__":
 #
 # If your tasks table already exists, run this too:
 # alter table public.tasks add column if not exists team text;
+# alter table public.tasks add column if not exists start_date date;
