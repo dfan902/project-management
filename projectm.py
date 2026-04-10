@@ -395,14 +395,27 @@ def render_project_timeline(project_tasks: pd.DataFrame) -> None:
     if overdue_labels:
         fig.for_each_trace(lambda trace: trace.update(opacity=1.0) if trace.name in overdue_labels else None)
 
-    today = pd.Timestamp(date.today())
-    fig.add_vline(
+    # Plotly can raise a Timestamp arithmetic TypeError with add_vline + annotation.
+    # Using a vertical shape plus a separate annotation avoids that bug reliably.
+    today = pd.Timestamp(date.today()).to_pydatetime()
+    fig.add_shape(
+        type="line",
+        x0=today,
+        x1=today,
+        y0=0,
+        y1=1,
+        xref="x",
+        yref="paper",
+        line=dict(width=2, dash="dash", color="#111827"),
+    )
+    fig.add_annotation(
         x=today,
-        line_width=2,
-        line_dash="dash",
-        line_color="#111827",
-        annotation_text="Today",
-        annotation_position="top",
+        y=1,
+        xref="x",
+        yref="paper",
+        text="Today",
+        showarrow=False,
+        yanchor="bottom",
     )
 
     fig.update_yaxes(autorange="reversed")
